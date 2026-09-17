@@ -1,6 +1,7 @@
 import 'dotenv/config'
 import { chromium, type Browser, type Cookie, type Locator, type Page } from 'playwright'
-import { mkdir, readFile } from 'node:fs/promises'
+import { access, mkdir, readFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import { createInterface } from 'node:readline/promises'
 import { stdin as input, stdout as output } from 'node:process'
 import dayjs from 'dayjs'
@@ -9,6 +10,7 @@ import utc from 'dayjs/plugin/utc'
 import timezone from 'dayjs/plugin/timezone'
 import type { DouyinCookie, SameSite } from './types/douyin-cookie'
 import type { Yiyan } from './types/yiyan'
+import { acquireRunLock, RuntimeState } from './runtime-state'
 
 dayjs.extend(utc)
 dayjs.extend(timezone)
@@ -19,6 +21,11 @@ const DOUYIN_COOKIE_KEY = 'DOUYIN_COOKIE'
 const DOUYIN_TARGET_NAMES_KEY = 'DOUYIN_TARGET_NAMES'
 const YIYAN_INCLUDE_SOURCE_KEY = 'YIYAN_INCLUDE_SOURCE'
 const SPARK_MESSAGE_TEMPLATE_KEY = 'SPARK_MESSAGE_TEMPLATE'
+const SPARK_STATE_PATH_KEY = 'SPARK_STATE_PATH'
+const DRY_RUN_KEY = 'DRY_RUN'
+const MAX_SENDS_PER_RUN_KEY = 'MAX_SENDS_PER_RUN'
+const SEND_GAP_MIN_SECONDS_KEY = 'SEND_GAP_MIN_SECONDS'
+const SEND_GAP_MAX_SECONDS_KEY = 'SEND_GAP_MAX_SECONDS'
 const FAILURE_SCREENSHOT_DIRECTORY = 'artifacts'
 
 const CHAT_PAGE_READY_TIMEOUT = 30000
@@ -27,6 +34,13 @@ const SEARCH_RESULT_TIMEOUT = 5000
 const SEARCH_RETRY_LIMIT = 3
 const SEARCH_RETRY_INTERVAL = 2000
 const SEARCH_INPUT_RESET_DELAY = 500
+const SEND_VERIFICATION_TIMEOUT = 10000
+const MANUAL_VERIFICATION_TIMEOUT = 5 * 60 * 1000
+const BROWSER_STATE_DIRECTORY = 'data/browser-state'
+const SAFETY_WARNING_PATTERN =
+  /(操作频繁|访问过于频繁|安全验证|请完成验证|滑块验证|账号存在风险|短信验证)/
+const MANUAL_VERIFICATION_PATTERN = /(安全验证|请完成验证|滑块验证|短信验证)/
+const HARD_STOP_WARNING_PATTERN = /(操作频繁|访问过于频繁|账号存在风险)/
 
 const MESSAGE_TEMPLATE_PLACEHOLDER_PATTERN = /\{\{\s*([a-zA-Z]+)\s*\}\}/g
 const MESSAGE_TEMPLATE_PLACEHOLDERS = [
@@ -56,19 +70,44 @@ async function main(): Promise<void> {
   const headless = resolveHeadless()
   const autoClose = resolveAutoClose()
   const includeYiyanSource = resolveYiyanIncludeSource()
+  const dryRun = resolveBooleanEnvironment(DRY_RUN_KEY, true)
+  const maxSendsPerRun = resolvePositiveIntegerEnvironment(MAX_SENDS_PER_RUN_KEY, 10)
+  const sendGapMinSeconds = resolveNonNegativeIntegerEnvironment(SEND_GAP_MIN_SECONDS_KEY, 8)
+  const sendGapMaxSeconds = resolveNonNegativeIntegerEnvironment(SEND_GAP_MAX_SECONDS_KEY, 15)
+  if (sendGapMaxSeconds < sendGapMinSeconds) {
+    throw new Error(`${SEND_GAP_MAX_SECONDS_KEY} 不能小于 ${SEND_GAP_MIN_SECONDS_KEY}`)
+  }
   const globalMessageTemplate = resolveSparkMessageTemplate()
   const accounts = resolveDouyinAccounts(globalMessageTemplate)
   const yiyans = await resolveYiyans()
-  const browser = await chromium.launch({
-    headless,
-    ...(browserPath ? { executablePath: browserPath } : {}),
-  })
+  const statePath = process.env[SPARK_STATE_PATH_KEY]?.trim() || 'data/spark-state.json'
+  const runtimeState = await RuntimeState.load(statePath)
+  const releaseRunLock = await acquireRunLock(`${statePath}.lock`)
+  let browser: Browser | undefined
   const failures: Error[] = []
 
   try {
-    for (const account of accounts) {
+    browser = await chromium.launch({
+      headless,
+      ...(browserPath ? { executablePath: browserPath } : {}),
+    })
+
+    for (const [accountIndex, account] of accounts.entries()) {
       try {
-        await runDouyinAccount(browser, account, yiyans, includeYiyanSource, autoClose)
+        await runDouyinAccount(
+          browser,
+          account,
+          accountIndex,
+          yiyans,
+          includeYiyanSource,
+          autoClose,
+          headless,
+          runtimeState,
+          dryRun,
+          maxSendsPerRun,
+          sendGapMinSeconds,
+          sendGapMaxSeconds,
+        )
       } catch (error) {
         const accountError = toError(error)
         failures.push(
@@ -93,7 +132,11 @@ async function main(): Promise<void> {
     }
   } finally {
     // 无论任务是否失败，都关闭浏览器以释放 Playwright 持有的进程句柄。
-    await browser.close()
+    try {
+      if (browser) await browser.close()
+    } finally {
+      await releaseRunLock()
+    }
   }
 }
 
@@ -110,16 +153,31 @@ async function main(): Promise<void> {
 async function runDouyinAccount(
   browser: Browser,
   account: DouyinAccount,
+  accountIndex: number,
   yiyans: Yiyan[],
   includeYiyanSource: boolean,
   autoClose: boolean,
+  headless: boolean,
+  runtimeState: RuntimeState,
+  dryRun: boolean,
+  maxSendsPerRun: number,
+  sendGapMinSeconds: number,
+  sendGapMaxSeconds: number,
 ): Promise<void> {
-  const context = await browser.newContext()
+  const browserStatePath = join(BROWSER_STATE_DIRECTORY, `account-${accountIndex + 1}.json`)
+  const hasBrowserState = await fileExists(browserStatePath)
+  const context = await browser.newContext(
+    hasBrowserState ? { storageState: browserStatePath } : undefined,
+  )
   let page: Page | undefined
 
   try {
     console.log(`开始执行账号：${account.name}`)
-    await context.addCookies(account.cookies)
+    if (!hasBrowserState) {
+      await context.addCookies(account.cookies)
+    } else {
+      console.log(`[${account.name}] 已加载本地验证会话`)
+    }
 
     page = await context.newPage()
     await page.goto('https://www.douyin.com/chat', {
@@ -143,8 +201,26 @@ async function runDouyinAccount(
     const needsYiyan =
       account.messageTemplate === undefined ||
       /\{\{\s*(yiyan|from)\s*\}\}/.test(account.messageTemplate)
+    const today = dayjs().tz('Asia/Shanghai').format('YYYY-MM-DD')
+    let sentCount = 0
 
     for (const targetName of account.targetNames) {
+      const previousStatus = runtimeState.getStatus(today, account.name, targetName)
+      if (previousStatus === 'sent') {
+        console.log(`[${account.name}] 今日已经发送，跳过：${targetName}`)
+        continue
+      }
+      if (previousStatus === 'pending') {
+        throw new Error(
+          `[${account.name}] ${targetName} 存在未确认的发送记录；为避免重复发送，本次任务已停止，请人工检查聊天记录和状态文件`,
+        )
+      }
+      if (sentCount >= maxSendsPerRun) {
+        console.log(`[${account.name}] 已达到本轮发送上限 ${maxSendsPerRun}，停止处理剩余好友`)
+        break
+      }
+
+      await handleSafetyWarning(page, account.name, !headless, browserStatePath)
       console.log(`[${account.name}] 开始搜索会话：${targetName}`)
 
       const searchResult = await searchConversation(page, searchInput, account.name, targetName)
@@ -158,6 +234,8 @@ async function runDouyinAccount(
 
       await searchResult.getByText(/^(发消息|发私信)$/).click({ timeout: 5000 })
       console.log(`[${account.name}] 已打开私信：${targetName}`)
+      await assertConversationTarget(page, targetName)
+      await handleSafetyWarning(page, account.name, !headless, browserStatePath)
 
       const editorInput = page
         .locator(
@@ -181,10 +259,24 @@ async function runDouyinAccount(
         message = includeYiyanSource ? `${yiyan.hitokoto}\n——「${yiyan.from}」` : yiyan.hitokoto
       }
 
-      await page.keyboard.insertText(message)
-      await page.keyboard.press('Enter')
-      console.log(`[${account.name}] 已发送消息：${targetName}`)
-      await page.waitForTimeout(1000)
+      if (dryRun) {
+        console.log(`[${account.name}] 模拟演练通过，未发送消息：${targetName}`)
+        continue
+      }
+
+      // 在按下 Enter 前落盘 pending；即使进程意外退出，下次也不会盲目重复发送。
+      await runtimeState.markPending(today, account.name, targetName)
+      await sendMessageAndVerify(page, editorInput, message)
+      await runtimeState.markSent(today, account.name, targetName)
+      sentCount += 1
+      console.log(`[${account.name}] 消息已验证发送成功：${targetName}`)
+      await handleSafetyWarning(page, account.name, !headless, browserStatePath)
+
+      const gapSeconds = randomInteger(sendGapMinSeconds, sendGapMaxSeconds)
+      if (gapSeconds > 0) {
+        console.log(`[${account.name}] 等待 ${gapSeconds} 秒后处理下一位好友`)
+        await page.waitForTimeout(gapSeconds * 1000)
+      }
     }
 
     await page.waitForTimeout(5000)
@@ -197,6 +289,7 @@ async function runDouyinAccount(
       )
     }
 
+    await persistBrowserState(page, browserStatePath)
     console.log(`账号执行完成：${account.name}`)
   } catch (error) {
     await captureFailureScreenshot(page, account.name)
@@ -206,6 +299,167 @@ async function runDouyinAccount(
       await context.close()
     }
   }
+}
+
+async function assertConversationTarget(page: Page, targetName: string): Promise<void> {
+  const headerSelectors = [
+    '.RightPanelHeadertitleContainer',
+    '[class*="RightPanelHeader"]',
+    '[class*="rightPanelHeader"]',
+  ]
+
+  for (const selector of headerSelectors) {
+    const exactTitle = page.locator(selector).getByText(targetName, { exact: true }).first()
+    const matched = await exactTitle
+      .waitFor({ state: 'visible', timeout: 3000 })
+      .then(() => true)
+      .catch(() => false)
+    if (matched) return
+  }
+
+  throw new Error(`无法确认当前会话标题为“${targetName}”，已停止发送以防错发`)
+}
+
+async function sendMessageAndVerify(
+  page: Page,
+  editorInput: Locator,
+  message: string,
+): Promise<void> {
+  const exactMessage = page.getByText(message, { exact: true })
+  const previousMessageCount = await exactMessage.count()
+
+  await page.keyboard.insertText(message)
+  await page.keyboard.press('Enter')
+
+  let editorCleared = await waitForEditorToClear(editorInput, SEND_VERIFICATION_TIMEOUT)
+  let messageAppeared = await waitForMessageCountToIncrease(
+    exactMessage,
+    previousMessageCount,
+    SEND_VERIFICATION_TIMEOUT,
+  )
+
+  if (!editorCleared && !messageAppeared) {
+    // 输入框仍保留完整消息且没有新气泡时，再按一次 Enter 是可判定的安全重试。
+    const currentText = await readEditorText(editorInput)
+    if (normalizeText(currentText) === normalizeText(message)) {
+      await page.keyboard.press('Enter')
+      editorCleared = await waitForEditorToClear(editorInput, SEND_VERIFICATION_TIMEOUT)
+      messageAppeared = await waitForMessageCountToIncrease(
+        exactMessage,
+        previousMessageCount,
+        SEND_VERIFICATION_TIMEOUT,
+      )
+    }
+  }
+
+  if (!editorCleared || !messageAppeared) {
+    const reason = editorCleared
+      ? '输入框已清空，但没有确认到新消息气泡，发送结果不明确'
+      : '输入框未清空，发送没有得到确认'
+    throw new Error(`${reason}；已保留 pending 状态并停止，避免重复发送`)
+  }
+}
+
+async function waitForEditorToClear(editorInput: Locator, timeout: number): Promise<boolean> {
+  return waitUntil(async () => normalizeText(await readEditorText(editorInput)) === '', timeout)
+}
+
+async function readEditorText(editorInput: Locator): Promise<string> {
+  return editorInput.evaluate((element) => element.textContent ?? '').catch(() => '')
+}
+
+async function waitForMessageCountToIncrease(
+  locator: Locator,
+  previousCount: number,
+  timeout: number,
+): Promise<boolean> {
+  return waitUntil(async () => (await locator.count()) > previousCount, timeout)
+}
+
+async function waitUntil(check: () => Promise<boolean>, timeout: number): Promise<boolean> {
+  const deadline = Date.now() + timeout
+  while (Date.now() < deadline) {
+    if (await check()) return true
+    await new Promise((resolve) => setTimeout(resolve, 250))
+  }
+  return false
+}
+
+async function handleSafetyWarning(
+  page: Page,
+  accountName: string,
+  allowManualVerification: boolean,
+  browserStatePath: string,
+): Promise<void> {
+  const initialWarning = await findVisibleSafetyWarning(page)
+  if (!initialWarning) return
+
+  if (
+    HARD_STOP_WARNING_PATTERN.test(initialWarning) ||
+    !MANUAL_VERIFICATION_PATTERN.test(initialWarning) ||
+    !allowManualVerification
+  ) {
+    throw new Error(`检测到平台安全提示“${initialWarning}”，本轮立即停止`)
+  }
+
+  console.log(
+    `[${accountName}] 检测到“${initialWarning}”，请在浏览器中手动完成验证；程序最多等待 5 分钟`,
+  )
+  const deadline = Date.now() + MANUAL_VERIFICATION_TIMEOUT
+
+  while (Date.now() < deadline) {
+    const warning = await findVisibleSafetyWarning(page)
+    if (warning && HARD_STOP_WARNING_PATTERN.test(warning)) {
+      throw new Error(`检测到平台安全提示“${warning}”，本轮立即停止`)
+    }
+    if (!warning) {
+      await page.waitForTimeout(1500)
+      if (!(await findVisibleSafetyWarning(page))) {
+        await persistBrowserState(page, browserStatePath)
+        console.log(`[${accountName}] 手动验证已通过，本地会话已保存，继续执行`)
+        return
+      }
+    }
+    await page.waitForTimeout(500)
+  }
+
+  throw new Error('等待手动验证超时，本轮已停止')
+}
+
+async function findVisibleSafetyWarning(page: Page): Promise<string | undefined> {
+  const warningCandidates = page.locator(
+    '[role="dialog"], [role="alert"], .semi-toast-content, [class*="captcha"], [class*="Captcha"], [class*="verify"], [class*="Verify"]',
+  )
+  const count = Math.min(await warningCandidates.count(), 30)
+
+  for (let index = 0; index < count; index += 1) {
+    const candidate = warningCandidates.nth(index)
+    if (!(await candidate.isVisible().catch(() => false))) continue
+    const text = await candidate.innerText().catch(() => '')
+    const match = text.match(SAFETY_WARNING_PATTERN)
+    if (match) return match[1]
+  }
+
+  return undefined
+}
+
+async function persistBrowserState(page: Page, browserStatePath: string): Promise<void> {
+  await mkdir(BROWSER_STATE_DIRECTORY, { recursive: true })
+  await page.context().storageState({ path: browserStatePath })
+}
+
+async function fileExists(path: string): Promise<boolean> {
+  return access(path)
+    .then(() => true)
+    .catch(() => false)
+}
+
+function normalizeText(value: string): string {
+  return value.replace(/\s+/g, ' ').trim()
+}
+
+function randomInteger(minimum: number, maximum: number): number {
+  return Math.floor(Math.random() * (maximum - minimum + 1)) + minimum
 }
 
 /**
@@ -391,6 +645,30 @@ function resolveYiyanIncludeSource(): boolean {
   }
 
   throw new Error(`${YIYAN_INCLUDE_SOURCE_KEY} 只能配置为 true 或 false`)
+}
+
+function resolveBooleanEnvironment(key: string, defaultValue: boolean): boolean {
+  const value = process.env[key]?.trim().toLowerCase()
+  if (!value) return defaultValue
+  if (value === 'true') return true
+  if (value === 'false') return false
+  throw new Error(`${key} 只能配置为 true 或 false`)
+}
+
+function resolvePositiveIntegerEnvironment(key: string, defaultValue: number): number {
+  const value = resolveNonNegativeIntegerEnvironment(key, defaultValue)
+  if (value < 1) throw new Error(`${key} 必须是大于 0 的整数`)
+  return value
+}
+
+function resolveNonNegativeIntegerEnvironment(key: string, defaultValue: number): number {
+  const text = process.env[key]?.trim()
+  if (!text) return defaultValue
+  const value = Number(text)
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`${key} 必须是大于等于 0 的整数`)
+  }
+  return value
 }
 
 /**
