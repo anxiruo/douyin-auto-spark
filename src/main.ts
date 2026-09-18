@@ -36,6 +36,7 @@ const SEARCH_RETRY_INTERVAL = 2000
 const SEARCH_INPUT_RESET_DELAY = 500
 const SEND_VERIFICATION_TIMEOUT = 10000
 const MANUAL_VERIFICATION_TIMEOUT = 5 * 60 * 1000
+const LOGIN_PROMPT_WAIT_TIMEOUT = 5000
 const BROWSER_STATE_DIRECTORY = 'data/browser-state'
 const SAFETY_WARNING_PATTERN =
   /(操作频繁|访问过于频繁|安全验证|请完成验证|滑块验证|账号存在风险|短信验证)/
@@ -185,13 +186,24 @@ async function runDouyinAccount(
     })
 
     const searchInput = page.locator('input.semi-input[placeholder="搜索"]').first()
-    const searchVisible = await searchInput
+    await handleManualLogin(page, searchInput, account.name, !headless, browserStatePath)
+
+    let searchVisible = await searchInput
       .waitFor({ state: 'visible', timeout: CHAT_PAGE_READY_TIMEOUT })
       .then(() => true)
       .catch(() => false)
 
     if (!searchVisible) {
-      throw new Error('聊天页搜索框未出现，Cookie 可能已经失效')
+      // 某些网络环境下登录弹窗会延迟出现，再检查一次后才判定失败。
+      await handleManualLogin(page, searchInput, account.name, !headless, browserStatePath)
+      searchVisible = await searchInput
+        .waitFor({ state: 'visible', timeout: CHAT_PAGE_READY_TIMEOUT })
+        .then(() => true)
+        .catch(() => false)
+    }
+
+    if (!searchVisible) {
+      throw new Error('聊天页搜索框未出现，Cookie 可能已经失效或页面加载异常')
     }
 
     await waitForChatListReady(page, account.name)
@@ -424,6 +436,63 @@ async function handleSafetyWarning(
   }
 
   throw new Error('等待手动验证超时，本轮已停止')
+}
+
+async function handleManualLogin(
+  page: Page,
+  searchInput: Locator,
+  accountName: string,
+  allowManualLogin: boolean,
+  browserStatePath: string,
+): Promise<void> {
+  const loginPrompt = await waitForLoginPrompt(page, LOGIN_PROMPT_WAIT_TIMEOUT)
+  if (!loginPrompt) return
+
+  if (!allowManualLogin) {
+    throw new Error(`检测到“${loginPrompt}”，Cookie 已失效且云端无法人工登录`)
+  }
+
+  console.log(
+    `[${accountName}] 检测到“${loginPrompt}”，请在浏览器中扫码或使用验证码登录；程序最多等待 5 分钟`,
+  )
+  const loggedIn = await waitUntil(
+    () => searchInput.isVisible().catch(() => false),
+    MANUAL_VERIFICATION_TIMEOUT,
+  )
+
+  if (!loggedIn) {
+    throw new Error('等待人工登录超时，本轮已停止')
+  }
+
+  await persistBrowserState(page, browserStatePath)
+  console.log(`[${accountName}] 人工登录成功，本地会话已保存，继续执行`)
+}
+
+async function waitForLoginPrompt(page: Page, timeout: number): Promise<string | undefined> {
+  let prompt: string | undefined
+  const found = await waitUntil(async () => {
+    prompt = await findVisibleLoginPrompt(page)
+    return prompt !== undefined
+  }, timeout)
+  return found ? prompt : undefined
+}
+
+async function findVisibleLoginPrompt(page: Page): Promise<string | undefined> {
+  const labels = ['扫码登录', '验证码登录', '密码登录']
+  for (const label of labels) {
+    const candidates = page.getByText(label, { exact: true })
+    const count = Math.min(await candidates.count(), 10)
+    for (let index = 0; index < count; index += 1) {
+      if (
+        await candidates
+          .nth(index)
+          .isVisible()
+          .catch(() => false)
+      )
+        return label
+    }
+  }
+  return undefined
 }
 
 async function findVisibleSafetyWarning(page: Page): Promise<string | undefined> {

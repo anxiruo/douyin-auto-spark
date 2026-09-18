@@ -2,6 +2,12 @@ name: 🚀 续一次火
 
 on:
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 只检查登录和会话，不发送消息
+        required: true
+        default: true
+        type: boolean
   schedule:
     - cron: "0 0 * * *"
       timezone: "Asia/Shanghai"
@@ -39,7 +45,7 @@ jobs:
           DOUYIN_TARGET_NAMES: ${{ secrets.DOUYIN_TARGET_NAMES }}
           YIYAN_INCLUDE_SOURCE: ${{ secrets.YIYAN_INCLUDE_SOURCE }}
           SPARK_MESSAGE_TEMPLATE: ${{ secrets.SPARK_MESSAGE_TEMPLATE }}
-          DRY_RUN: "false"
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
           AUTO_CLOSE: "true"
           PLAYWRIGHT_HEADLESS: "true"
           MAX_SENDS_PER_RUN: "10"
