@@ -351,10 +351,10 @@ async function sendMessageAndVerify(
   )
 
   if (!editorCleared && !messageAppeared) {
-    // 输入框仍保留完整消息且没有新气泡时，再按一次 Enter 是可判定的安全重试。
+    // 输入框仍保留完整消息且没有新气泡时，尝试另一种常见发送快捷键。
     const currentText = await readEditorText(editorInput)
     if (normalizeText(currentText) === normalizeText(message)) {
-      await page.keyboard.press('Enter')
+      await page.keyboard.press('Control+Enter')
       editorCleared = await waitForEditorToClear(editorInput, SEND_VERIFICATION_TIMEOUT)
       messageAppeared = await waitForMessageCountToIncrease(
         exactMessage,
