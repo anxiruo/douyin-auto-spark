@@ -8,6 +8,16 @@ on:
         required: true
         default: true
         type: boolean
+      target_names:
+        description: 临时好友名称 JSON；留空时使用仓库 Secret
+        required: false
+        default: ""
+        type: string
+      message:
+        description: 临时消息内容；留空时使用仓库 Secret 或随机一言
+        required: false
+        default: ""
+        type: string
   schedule:
     - cron: "0 0 * * *"
       timezone: "Asia/Shanghai"
@@ -42,9 +52,9 @@ jobs:
         env:
           DOUYIN_ACCOUNTS: ${{ secrets.DOUYIN_ACCOUNTS }}
           DOUYIN_COOKIE: ${{ secrets.DOUYIN_COOKIE }}
-          DOUYIN_TARGET_NAMES: ${{ secrets.DOUYIN_TARGET_NAMES }}
+          DOUYIN_TARGET_NAMES: ${{ github.event_name == 'workflow_dispatch' && inputs.target_names || secrets.DOUYIN_TARGET_NAMES }}
           YIYAN_INCLUDE_SOURCE: ${{ secrets.YIYAN_INCLUDE_SOURCE }}
-          SPARK_MESSAGE_TEMPLATE: ${{ secrets.SPARK_MESSAGE_TEMPLATE }}
+          SPARK_MESSAGE_TEMPLATE: ${{ github.event_name == 'workflow_dispatch' && inputs.message || secrets.SPARK_MESSAGE_TEMPLATE }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
           AUTO_CLOSE: "true"
           PLAYWRIGHT_HEADLESS: "true"
